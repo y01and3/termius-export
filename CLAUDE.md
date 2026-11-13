@@ -82,10 +82,11 @@ Two rules enforced in `crypto.py`:
 
 ---
 
-## Six traps
+## Seven traps
 
-All six were hit during development — the fifth only once a Mac was involved, the sixth only
-once `_dump_keys` was moved somewhere a test could reach it. Don't rediscover them.
+All seven were hit during development — the fifth only once a Mac was involved, the sixth only
+once `_dump_keys` was moved somewhere a test could reach it, the seventh only on a profile that
+had been used for years with groups and without sync. Don't rediscover them.
 
 ### 1. LevelDB holds multiple generations of the same record
 
@@ -318,6 +319,34 @@ treats a name ending in a verifier-reserved suffix as taken, so the counter move
 The general lesson is the one the tests section already makes: this lived in `cli.py`, so
 **nothing could test it**. Moving it to `keyfiles.py` is what surfaced all of it. When a
 function cannot be reached from a test, that is a fact about the design, not about the test.
+
+### 7. A host's credentials are not always on the host's own row
+
+Measured on a real macOS (DMG) profile with 146 raw host rows. The export ran clean and every
+self-check passed, yet many hosts came out with no username or password, and nested groups lost
+their parents. Three separate causes:
+
+- **Group inheritance.** Termius shows an empty host field as inheriting from the host's group,
+  and that group from its `parent_group`. `normalize` used to read only the host's own
+  `ssh_config`, and kept only the innermost group's label, so `Clients/Acme` became `Acme`.
+  It now walks host → group → parents for the identity, key, port and proxy, field by field,
+  and writes the full `/`-separated path. An empty string here means "unset", deliberately
+  unlike the empty `label` of trap 2: that is what Termius itself shows.
+- **Rows created while sync is off.** 35 hosts, 34 configs and 3 groups had `id: undefined`,
+  not a missing `id`. Every such row shares that one value, so indexing on it can resolve a
+  reference to an unrelated row. Some of these rows also hold `local_id` only as the IndexedDB
+  record key (`145.0`, a float). `normalize.adopt_record_key` drops the meaningless `id` and
+  takes `local_id` from the key, before deduplication, so these rows dedup and dereference by
+  `local_id` like any other.
+- **`ssh_config_identities`.** Newer Termius links a config to its identity through this join
+  table rather than `ssh_configs.identity`. It is now read as a fallback.
+
+With only the first cause fixed, the profile exported 105 passwords and 106 usernames for 145
+hosts. With all three, 135 and 138, and the deduped host count dropped to the true 144 — the 145th had been a second generation of one never-synced
+host that only became recognisable once its `local_id` was.
+
+The lesson repeats trap 1's: **compare counts against what the application shows.** All checks
+passing said only that the output matched the model, not that the model matched Termius.
 
 ---
 

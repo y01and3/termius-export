@@ -22,6 +22,8 @@ from dataclasses import dataclass
 
 from ccl_chromium_reader import ccl_chromium_indexeddb as ccl
 
+from .normalize import adopt_record_key
+
 #: Databases relevant to migration. The rest (history_commands, activities, ...) are not.
 WANTED_DATABASES = (
     "hosts",
@@ -34,6 +36,8 @@ WANTED_DATABASES = (
     "tag_hosts",
     "pf_rules",
     "known_hosts",
+    # Newer Termius links a config to its identity here instead of ssh_configs.identity.
+    "ssh_config_identities",
 )
 
 
@@ -105,7 +109,11 @@ def read_tables(leveldb_path: pathlib.Path, *, keep_all_versions: bool = False) 
         store_names = list(db.object_store_names)
         if not store_names:
             continue
-        rows = [rec.value for rec in db[store_names[0]].iterate_records() if isinstance(rec.value, dict)]
+        rows = [
+            adopt_record_key(rec.value, rec.key.value)
+            for rec in db[store_names[0]].iterate_records()
+            if isinstance(rec.value, dict)
+        ]
         before[name] = len(rows)
         tables[name] = rows if keep_all_versions else _dedup_latest(rows)
 
