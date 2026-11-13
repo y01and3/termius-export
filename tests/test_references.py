@@ -18,9 +18,22 @@ from termius_export.normalize import adopt_record_key, build_model
 
 
 class _Undefined:
-    """Stands in for ccl_chromium_reader's sentinel for V8 `undefined`."""
+    """Stands in for ccl_chromium_reader's sentinel for V8 `undefined`.
+
+    Matches the real class on the three behaviours that matter: falsy, unhashable (``__eq__``
+    without ``__hash__``), and ``str()`` yielding ``"<Undefined>"``.
+    """
+
+    def __bool__(self):
+        return False
+
+    def __eq__(self, other):
+        return isinstance(other, _Undefined)
 
     def __repr__(self):
+        return "<Undefined>"
+
+    def __str__(self):
         return "<Undefined>"
 
 
@@ -67,6 +80,13 @@ class AdoptRecordKeyTests(unittest.TestCase):
     def test_a_boolean_is_not_an_id(self):
         row = adopt_record_key({"id": True}, 3.0)
         self.assertNotIn("id", row)
+
+    def test_integral_float_ids_from_v8_doubles_are_preserved_as_ints(self):
+        """V8 serialises integers outside Smi range (and HeapNumbers) as IEEE-754 doubles."""
+        row = adopt_record_key({"id": 3_000_000_000.0, "local_id": 4.0}, 99.0)
+        self.assertEqual((row["id"], row["local_id"]), (3_000_000_000, 4))
+        self.assertIsInstance(row["id"], int)
+        self.assertIsInstance(row["local_id"], int)
 
 
 class GroupInheritanceTests(unittest.TestCase):
@@ -203,6 +223,21 @@ class NeverSyncedRowTests(unittest.TestCase):
         )
         users = {h.label: h.username for h in model.hosts}
         self.assertEqual(users, {"a": "alice", "b": "bob"})
+
+    def test_build_model_ignores_undefined_ids_even_without_adopt_record_key(self):
+        model = _model(
+            hosts=[
+                {"id": UNDEFINED, "local_id": 1, "label": "a", "address": "192.0.2.21", "identity": {"local_id": 1.0}},
+                {"id": UNDEFINED, "local_id": 2, "label": "b", "address": "192.0.2.22", "identity": {"local_id": 2}},
+            ],
+            ssh_identities=[
+                {"id": UNDEFINED, "local_id": 1, "username": "alice", "password": UNDEFINED},
+                {"id": UNDEFINED, "local_id": 2.0, "username": UNDEFINED, "password": "secret"},
+            ],
+        )
+        by_label = _by_label(model)
+        self.assertEqual((by_label["a"].username, by_label["a"].password), ("alice", ""))
+        self.assertEqual((by_label["b"].username, by_label["b"].password), ("", "secret"))
 
 
 if __name__ == "__main__":

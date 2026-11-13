@@ -12,6 +12,7 @@ Miss any hop and the username and key both come out empty.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from .model import (
@@ -36,10 +37,24 @@ if TYPE_CHECKING:
     from .source import RawTables
 
 
-def _is_ref_id(value) -> bool:
-    # bool is an int subclass but never an id. Anything else that is not int/str is V8's
-    # `undefined`, which ccl_chromium_reader hands back as a sentinel object.
-    return isinstance(value, (int, str)) and not isinstance(value, bool)
+def _coerce_id(value) -> int | str | None:
+    """Canonicalise a Termius entity id, or return None if ``value`` is not one.
+
+    V8's structured-clone format encodes small integers as int32/uint32 (``int``) and larger or
+    heap-allocated numbers — as well as IndexedDB numeric record keys — as IEEE-754 doubles
+    (``float``, e.g. ``145.0``). ``undefined`` arrives from ``ccl_chromium_reader`` as a custom
+    sentinel object, and ``bool`` is an ``int`` subclass in Python. Normalising integral floats
+    to ``int`` makes ``145`` and ``145.0`` name the same entity.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) and value.is_integer() else None
+    if isinstance(value, str):
+        return value if value else None
+    return None
 
 
 def adopt_record_key(row: dict, record_key) -> dict:
@@ -51,23 +66,26 @@ def adopt_record_key(row: dict, record_key) -> dict:
     Drop the meaningless ``id`` and take ``local_id`` from the key, so these rows deduplicate
     and dereference by ``local_id`` like any other.
     """
-    if not _is_ref_id(row.get("id")):
+    if (rid := _coerce_id(row.get("id"))) is not None:
+        row["id"] = rid
+    else:
         row.pop("id", None)
-    if not _is_ref_id(row.get("local_id")):
-        try:
-            row["local_id"] = int(float(str(record_key)))
-        except (TypeError, ValueError):
-            row.pop("local_id", None)
+    if (lid := _coerce_id(row.get("local_id"))) is not None:
+        row["local_id"] = lid
+    elif (kid := _coerce_id(record_key)) is not None:
+        row["local_id"] = kid
+    else:
+        row.pop("local_id", None)
     return row
 
 
 def _index(rows: list[dict]) -> dict[str, dict]:
     idx: dict[str, dict] = {}
     for r in rows:
-        if r.get("id") is not None:
-            idx[f"id:{r['id']}"] = r
-        if r.get("local_id") is not None:
-            idx[f"lid:{r['local_id']}"] = r
+        if (rid := _coerce_id(r.get("id"))) is not None:
+            idx[f"id:{rid}"] = r
+        if (lid := _coerce_id(r.get("local_id"))) is not None:
+            idx[f"lid:{lid}"] = r
     return idx
 
 
@@ -75,23 +93,38 @@ def _deref(ref, idx: dict[str, dict]) -> dict | None:
     if not ref:
         return None
     if not isinstance(ref, dict):
-        return idx.get(f"id:{ref}") or idx.get(f"lid:{ref}")
+        cid = _coerce_id(ref)
+        return (idx.get(f"id:{cid}") or idx.get(f"lid:{cid}")) if cid is not None else None
     out = None
-    if _is_ref_id(ref.get("id")):
-        out = idx.get(f"id:{ref['id']}")
-    if out is None and _is_ref_id(ref.get("local_id")):
-        out = idx.get(f"lid:{ref['local_id']}")
+    if (rid := _coerce_id(ref.get("id"))) is not None:
+        out = idx.get(f"id:{rid}")
+    if out is None and (lid := _coerce_id(ref.get("local_id"))) is not None:
+        out = idx.get(f"lid:{lid}")
     return out
 
 
 def _entity_key(row: dict | None) -> str:
     if not row:
         return ""
-    return f"{row.get('id', '')}/{row.get('local_id', '')}"
+    rid = _coerce_id(row.get("id"))
+    lid = _coerce_id(row.get("local_id"))
+    return f"{'' if rid is None else rid}/{'' if lid is None else lid}"
 
 
 def _text(value) -> str:
-    return value.strip() if isinstance(value, str) else ("" if value is None else str(value))
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return ""
+        return str(int(value)) if value.is_integer() else str(value)
+    # Anything else is a V8 oddball sentinel such as ccl_chromium_reader's _Undefined, whose
+    # str() is "<Undefined>".
+    return ""
 
 
 def _proxy_kind(raw: str) -> str:
@@ -143,15 +176,16 @@ def build_model(tables: RawTables, dec: Decryptor, *, source_info: dict | None =
         if not private:
             continue
         label = _text(row.get("label"))
+        public = _text(row.get("public_key"))
         entity = _entity_key(row)
         key = Key(
             id=entity,
             label=label,
             # file_slug, not slug: this becomes a path component, and slug answers the ssh
             # question rather than the filename one. See model.file_slug.
-            file_base=file_slug(label, f"key_{row.get('local_id') or row.get('id')}"),
+            file_base=file_slug(label, f"key_{_coerce_id(row.get('local_id')) or _coerce_id(row.get('id'))}"),
             private_key=private if private.endswith("\n") else private + "\n",
-            public_key=(_text(row.get("public_key")) + "\n") if row.get("public_key") else "",
+            public_key=f"{public}\n" if public else "",
             passphrase=_text(row.get("passphrase")),
         )
         keys_by_entity[entity] = key
